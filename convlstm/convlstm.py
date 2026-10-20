@@ -1,23 +1,25 @@
-"""三层 ConvLSTM：由 notebook 单层版本改写。
+"""三层 ConvLSTM：把 notebook In [2] 的单层网络直接扩成三层。
 
-原 In [2] 只有一个 ``CLSTM_cell``，在时间维上循环。
-这里堆叠三层：当前层的 ``h_t`` 当作后一层的 ``x_t``。
+原代码只有::
 
-输入布局与原来一致::
+    self.convLSTM_cell = CLSTM_cell(input_dim, hidden_dim, kernel_size)
+
+这里改成 cell1 / cell2 / cell3。当前层的 ``h_t`` 当作后一层的 ``x_t``。
+构造函数签名与原来一致：``ConvLSTM(input_dim, hidden_dim, kernel_size)``。
+
+输入布局::
 
     inputs: (seq_len, batch, channels, height, width)
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
 
 
-KernelSize = Union[int, Tuple[int, int], List[Tuple[int, int]]]
-HiddenDim = Union[int, Sequence[int]]
 HiddenState = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -35,7 +37,7 @@ class CLSTM_cell(nn.Module):
         hy, hidden_state = cell(inputs[t, ...], hidden_state)
     """
 
-    def __init__(self, input_dim: int, hidden_dim: int, kernel_size: Union[int, Tuple[int, int]]):
+    def __init__(self, input_dim, hidden_dim, kernel_size):
         super(CLSTM_cell, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -49,11 +51,7 @@ class CLSTM_cell(nn.Module):
             bias=True,
         )
 
-    def forward(
-        self,
-        input_tensor: torch.Tensor,
-        hidden_state: HiddenState,
-    ) -> Tuple[torch.Tensor, HiddenState]:
+    def forward(self, input_tensor, hidden_state):
         h_cur, c_cur = hidden_state
         combined = torch.cat([input_tensor, h_cur], dim=1)
         combined_conv = self.conv(combined)
@@ -68,7 +66,7 @@ class CLSTM_cell(nn.Module):
         h_next = o * torch.tanh(c_next)
         return h_next, (h_next, c_next)
 
-    def init_hidden(self, batch_size: int, image_size: Tuple[int, int]) -> HiddenState:
+    def init_hidden(self, batch_size, image_size):
         height, width = image_size
         # device=self.conv.weight.device: 选择设备
         device = self.conv.weight.device
@@ -80,54 +78,57 @@ class CLSTM_cell(nn.Module):
 
 
 class ConvLSTM(nn.Module):
-    """三层 ConvLSTM（``num_layers=3``）。
+    """三层 ConvLSTM，由单层 In [2] 改写。
 
-    参数与 notebook 一致，只多了网络深度：
+    参数（与原来相同，只是内部变成三层）：
 
     - input_dim: 输入特征维数
-    - hidden_dim: 隐藏层状态的维数（int 则三层相同，也可给长度为 3 的列表）
+    - hidden_dim: 隐藏层状态的维数（int，三层共用；或长度为 3 的列表）
     - kernel_size / filter_size: 卷积核尺寸
-    - num_layers: 层，理解为网络深度，默认 3
     """
 
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: HiddenDim,
-        kernel_size: KernelSize,
-        num_layers: int = 3,
-    ):
+    def __init__(self, input_dim, hidden_dim, kernel_size):
         super(ConvLSTM, self).__init__()
-        if num_layers < 1:
-            raise ValueError("num_layers must be >= 1")
+        if isinstance(hidden_dim, int):
+            hidden_dim = [hidden_dim, hidden_dim, hidden_dim]
+        else:
+            hidden_dim = [int(v) for v in hidden_dim]
+            if len(hidden_dim) != 3:
+                raise ValueError("三层网络的 hidden_dim 必须是 int，或长度为 3 的列表")
 
         self.input_dim = input_dim
-        self.num_layers = num_layers
-        self.hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
-        self.kernel_size = self._extend_kernel_size(kernel_size, num_layers)
+        self.hidden_dim = hidden_dim
+        self.num_layers = 3
+        kernel_size = _to_pair(kernel_size)
 
-        # 三层堆叠：第 0 层读原始 x_t，之后每一层读上一层的 h_t
-        cell_list = []
-        for i in range(self.num_layers):
-            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
-            cell_list.append(
-                CLSTM_cell(cur_input_dim, self.hidden_dim[i], self.kernel_size[i])
-            )
-        self.cell_list = nn.ModuleList(cell_list)
+        # 单层时是 self.convLSTM_cell = CLSTM_cell(input_dim, hidden_dim, kernel_size)
+        # 三层：第 1 层读 x_t，第 2、3 层读上一层的 h_t
+        self.cell1 = CLSTM_cell(input_dim, hidden_dim[0], kernel_size)
+        self.cell2 = CLSTM_cell(hidden_dim[0], hidden_dim[1], kernel_size)
+        self.cell3 = CLSTM_cell(hidden_dim[1], hidden_dim[2], kernel_size)
+        self.cell_list = nn.ModuleList([self.cell1, self.cell2, self.cell3])
 
-    def _init_hidden(self, batch_size: int, image_size: Tuple[int, int]) -> List[HiddenState]:
+    def _init_hidden(self, batch_size, image_size):
         # 初始化返回的隐状态与后面使用的隐状态组成成分一样；
-        # 当前层的 h_t 会当作后一层的 x_t，所以每一层各自一份 (h, c)
+        # 当前层的 h_t 会当作后一层的 x_t，所以三层各自一份 (h, c)
         return [
-            self.cell_list[i].init_hidden(batch_size, image_size)
-            for i in range(self.num_layers)
+            self.cell1.init_hidden(batch_size, image_size),
+            self.cell2.init_hidden(batch_size, image_size),
+            self.cell3.init_hidden(batch_size, image_size),
         ]
 
-    def forward(
-        self,
-        inputs: Optional[torch.Tensor] = None,
-        hidden_state: Optional[List[HiddenState]] = None,
-    ) -> Tuple[torch.Tensor, List[HiddenState]]:
+    def _run_layer(self, cell, inputs, hidden_state):
+        # 取出时间长度，供下面按时间步更新 (h, c)
+        s = inputs.size(0)
+        output_inner = []
+        for t in range(s):
+            # 每一个时间步都更新 hidden_state 中的 h, c
+            # 当前时间步的输出 hidden_state，又作为下一时间步的输入 hidden_state
+            hy, hidden_state = cell(inputs[t, ...], hidden_state)
+            output_inner.append(hy)
+        return torch.stack(output_inner), hidden_state
+
+    def forward(self, inputs=None, hidden_state=None):
         if inputs is None:
             raise ValueError("inputs is required")
 
@@ -136,53 +137,14 @@ class ConvLSTM(nn.Module):
         if hidden_state is None:
             # 初始化 hidden_state，利用后面和 lstm 单元中的初始化函数
             hidden_state = self._init_hidden(batch_size=b, image_size=(h, w))
-        if len(hidden_state) != self.num_layers:
-            raise ValueError(
-                f"hidden_state must have {self.num_layers} layer states, got {len(hidden_state)}"
-            )
+        if len(hidden_state) != 3:
+            raise ValueError("三层网络的 hidden_state 必须包含 3 份 (h, c)")
 
-        cur_layer_input = inputs
-        last_state_list: List[HiddenState] = []
-
-        for layer_idx in range(self.num_layers):
-            output_inner = []
-            layer_state = hidden_state[layer_idx]
-            for t in range(s):
-                # 每一个时间步都更新 hidden_state 中的 h, c
-                # 当前时间步的输出 hidden_state，又作为下一时间步的输入 hidden_state
-                # 当前层的 h_t 会当作后一层的 x_t 作为输入使用
-                hy, layer_state = self.cell_list[layer_idx](cur_layer_input[t, ...], layer_state)
-                output_inner.append(hy)
-
-            layer_output = torch.stack(output_inner)
-            cur_layer_input = layer_output
-            last_state_list.append(layer_state)
-
-        return cur_layer_input, last_state_list
-
-    @staticmethod
-    def _extend_for_multilayer(param: HiddenDim, num_layers: int) -> List[int]:
-        if isinstance(param, int):
-            return [param] * num_layers
-        values = [int(v) for v in param]
-        if len(values) != num_layers:
-            raise ValueError(
-                f"hidden_dim length ({len(values)}) must equal num_layers ({num_layers})"
-            )
-        return values
-
-    @staticmethod
-    def _extend_kernel_size(kernel_size: KernelSize, num_layers: int) -> List[Tuple[int, int]]:
-        if isinstance(kernel_size, int):
-            return [_to_pair(kernel_size)] * num_layers
-        if isinstance(kernel_size, tuple) and len(kernel_size) == 2 and isinstance(kernel_size[0], int):
-            return [_to_pair(kernel_size)] * num_layers
-        kernels = [_to_pair(k) for k in kernel_size]  # type: ignore[union-attr]
-        if len(kernels) != num_layers:
-            raise ValueError(
-                f"kernel_size length ({len(kernels)}) must equal num_layers ({num_layers})"
-            )
-        return kernels
+        # 当前层的 h_t 会当作后一层的 x_t 作为输入使用
+        y1, s1 = self._run_layer(self.cell1, inputs, hidden_state[0])
+        y2, s2 = self._run_layer(self.cell2, y1, hidden_state[1])
+        y3, s3 = self._run_layer(self.cell3, y2, hidden_state[2])
+        return y3, [s1, s2, s3]
 
 
 if __name__ == "__main__":

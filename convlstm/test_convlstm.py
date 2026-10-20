@@ -8,20 +8,23 @@ from convlstm import CLSTM_cell, ConvLSTM
 
 
 class ConvLSTMTests(unittest.TestCase):
-    def test_default_is_three_layers(self):
+    def test_is_three_layers(self):
         model = ConvLSTM(input_dim=1, hidden_dim=8, kernel_size=3)
         self.assertEqual(model.num_layers, 3)
         self.assertEqual(len(model.cell_list), 3)
+        self.assertIs(model.cell_list[0], model.cell1)
+        self.assertIs(model.cell_list[1], model.cell2)
+        self.assertIs(model.cell_list[2], model.cell3)
         self.assertEqual(model.hidden_dim, [8, 8, 8])
 
     def test_layer_channel_wiring(self):
         model = ConvLSTM(input_dim=2, hidden_dim=[4, 8, 16], kernel_size=3)
-        self.assertEqual(model.cell_list[0].input_dim, 2)
-        self.assertEqual(model.cell_list[0].hidden_dim, 4)
-        self.assertEqual(model.cell_list[1].input_dim, 4)
-        self.assertEqual(model.cell_list[1].hidden_dim, 8)
-        self.assertEqual(model.cell_list[2].input_dim, 8)
-        self.assertEqual(model.cell_list[2].hidden_dim, 16)
+        self.assertEqual(model.cell1.input_dim, 2)
+        self.assertEqual(model.cell1.hidden_dim, 4)
+        self.assertEqual(model.cell2.input_dim, 4)
+        self.assertEqual(model.cell2.hidden_dim, 8)
+        self.assertEqual(model.cell3.input_dim, 8)
+        self.assertEqual(model.cell3.hidden_dim, 16)
 
     def test_forward_shapes(self):
         seq_len, batch, channels, height, width = 5, 2, 1, 16, 16
@@ -55,21 +58,21 @@ class ConvLSTMTests(unittest.TestCase):
 
         self.assertIsNotNone(inputs.grad)
         self.assertGreater(inputs.grad.abs().sum().item(), 0.0)
-        for layer_idx, cell in enumerate(model.cell_list):
-            self.assertIsNotNone(cell.conv.weight.grad, msg=f"layer {layer_idx} has no grad")
+        for name, cell in (("cell1", model.cell1), ("cell2", model.cell2), ("cell3", model.cell3)):
+            self.assertIsNotNone(cell.conv.weight.grad, msg=f"{name} has no grad")
             self.assertGreater(cell.conv.weight.grad.abs().sum().item(), 0.0)
 
     def test_optional_external_hidden_state(self):
-        model = ConvLSTM(input_dim=1, hidden_dim=4, kernel_size=3, num_layers=3)
+        model = ConvLSTM(input_dim=1, hidden_dim=4, kernel_size=3)
         inputs = torch.randn(3, 1, 1, 5, 5)
         hidden_state = model._init_hidden(batch_size=1, image_size=(5, 5))
         output, states = model(inputs, hidden_state=hidden_state)
         self.assertEqual(tuple(output.shape), (3, 1, 4, 5, 5))
         self.assertEqual(len(states), 3)
 
-    def test_hidden_dim_length_must_match_layers(self):
+    def test_hidden_dim_length_must_be_three(self):
         with self.assertRaises(ValueError):
-            ConvLSTM(input_dim=1, hidden_dim=[8, 8], kernel_size=3, num_layers=3)
+            ConvLSTM(input_dim=1, hidden_dim=[8, 8], kernel_size=3)
 
 
 if __name__ == "__main__":
