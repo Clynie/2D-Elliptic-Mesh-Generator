@@ -1,17 +1,9 @@
-"""Stacked ConvLSTM (default: 3 layers).
+"""三层 ConvLSTM：由 notebook 单层版本改写。
 
-This is a multilayer extension of the single-layer notebook cell:
+原 In [2] 只有一个 ``CLSTM_cell``，在时间维上循环。
+这里堆叠三层：当前层的 ``h_t`` 当作后一层的 ``x_t``。
 
-    class ConvLSTM(nn.Module):
-        def __init__(self, input_dim, hidden_dim, kernel_size):
-            ...
-            self.convLSTM_cell = CLSTM_cell(input_dim, hidden_dim, kernel_size)
-
-The single-layer network walks time with one cell. The three-layer network
-keeps that same cell and time loop, then stacks three cells so that the current
-layer's hidden state ``h_t`` is used as the next layer's input ``x_t``.
-
-Tensor layout matches the original notebook::
+输入布局与原来一致::
 
     inputs: (seq_len, batch, channels, height, width)
 """
@@ -38,13 +30,9 @@ def _to_pair(kernel_size: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
 
 
 class CLSTM_cell(nn.Module):
-    """Single-timestep ConvLSTM cell used by the stacked ConvLSTM.
-
-    Calling convention matches the notebook::
+    """单步 ConvLSTM 单元。调用方式和 notebook 一致::
 
         hy, hidden_state = cell(inputs[t, ...], hidden_state)
-
-    where ``hidden_state`` is the ``(h, c)`` pair.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, kernel_size: Union[int, Tuple[int, int]]):
@@ -53,8 +41,6 @@ class CLSTM_cell(nn.Module):
         self.hidden_dim = hidden_dim
         self.kernel_size = _to_pair(kernel_size)
         self.padding = (self.kernel_size[0] // 2, self.kernel_size[1] // 2)
-
-        # Concatenate x_t and h_{t-1} along channels, then emit the 4 LSTM gates.
         self.conv = nn.Conv2d(
             in_channels=self.input_dim + self.hidden_dim,
             out_channels=4 * self.hidden_dim,
@@ -84,6 +70,7 @@ class CLSTM_cell(nn.Module):
 
     def init_hidden(self, batch_size: int, image_size: Tuple[int, int]) -> HiddenState:
         height, width = image_size
+        # device=self.conv.weight.device: 选择设备
         device = self.conv.weight.device
         dtype = self.conv.weight.dtype
         return (
@@ -93,20 +80,14 @@ class CLSTM_cell(nn.Module):
 
 
 class ConvLSTM(nn.Module):
-    """Three-layer (by default) ConvLSTM built from stacked ``CLSTM_cell`` units.
+    """三层 ConvLSTM（``num_layers=3``）。
 
-    Parameters
-    ----------
-    input_dim:
-        Number of input feature channels.
-    hidden_dim:
-        Hidden-state channels. An int is broadcast to every layer; a sequence
-        must have length ``num_layers``.
-    kernel_size:
-        Convolution kernel size. An int or ``(kH, kW)`` is broadcast; a list
-        must have one pair per layer.
-    num_layers:
-        Network depth. Defaults to 3.
+    参数与 notebook 一致，只多了网络深度：
+
+    - input_dim: 输入特征维数
+    - hidden_dim: 隐藏层状态的维数（int 则三层相同，也可给长度为 3 的列表）
+    - kernel_size / filter_size: 卷积核尺寸
+    - num_layers: 层，理解为网络深度，默认 3
     """
 
     def __init__(
@@ -125,21 +106,18 @@ class ConvLSTM(nn.Module):
         self.hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
         self.kernel_size = self._extend_kernel_size(kernel_size, num_layers)
 
+        # 三层堆叠：第 0 层读原始 x_t，之后每一层读上一层的 h_t
         cell_list = []
         for i in range(self.num_layers):
-            # Layer 0 reads the raw input; later layers read the previous h_t.
             cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
             cell_list.append(
-                CLSTM_cell(
-                    input_dim=cur_input_dim,
-                    hidden_dim=self.hidden_dim[i],
-                    kernel_size=self.kernel_size[i],
-                )
+                CLSTM_cell(cur_input_dim, self.hidden_dim[i], self.kernel_size[i])
             )
         self.cell_list = nn.ModuleList(cell_list)
 
     def _init_hidden(self, batch_size: int, image_size: Tuple[int, int]) -> List[HiddenState]:
-        # One (h, c) pair per layer, on the same device as the corresponding cell.
+        # 初始化返回的隐状态与后面使用的隐状态组成成分一样；
+        # 当前层的 h_t 会当作后一层的 x_t，所以每一层各自一份 (h, c)
         return [
             self.cell_list[i].init_hidden(batch_size, image_size)
             for i in range(self.num_layers)
@@ -153,10 +131,10 @@ class ConvLSTM(nn.Module):
         if inputs is None:
             raise ValueError("inputs is required")
 
-        # Unpack image data for hidden-state initialization.
-        # inputs: (seq_len, batch, channels, height, width)
+        # 取出图片的数据，供下面初始化使用
         s, b, _, h, w = inputs.size()
         if hidden_state is None:
+            # 初始化 hidden_state，利用后面和 lstm 单元中的初始化函数
             hidden_state = self._init_hidden(batch_size=b, image_size=(h, w))
         if len(hidden_state) != self.num_layers:
             raise ValueError(
@@ -170,12 +148,13 @@ class ConvLSTM(nn.Module):
             output_inner = []
             layer_state = hidden_state[layer_idx]
             for t in range(s):
-                # Each timestep updates (h, c). The current layer's h_t is
-                # stacked and used as x_t for the next layer.
+                # 每一个时间步都更新 hidden_state 中的 h, c
+                # 当前时间步的输出 hidden_state，又作为下一时间步的输入 hidden_state
+                # 当前层的 h_t 会当作后一层的 x_t 作为输入使用
                 hy, layer_state = self.cell_list[layer_idx](cur_layer_input[t, ...], layer_state)
                 output_inner.append(hy)
 
-            layer_output = torch.stack(output_inner, dim=0)
+            layer_output = torch.stack(output_inner)
             cur_layer_input = layer_output
             last_state_list.append(layer_state)
 
@@ -208,7 +187,7 @@ class ConvLSTM(nn.Module):
 
 if __name__ == "__main__":
     seq_len, batch, channels, height, width = 10, 2, 1, 32, 32
-    model = ConvLSTM(input_dim=channels, hidden_dim=16, kernel_size=3, num_layers=3)
+    model = ConvLSTM(input_dim=channels, hidden_dim=16, kernel_size=3)
     x = torch.randn(seq_len, batch, channels, height, width)
     y, states = model(x)
     print("output:", tuple(y.shape))
