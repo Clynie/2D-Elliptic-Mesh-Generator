@@ -2,6 +2,8 @@
 target/
 *.iml
 *.class
+__pycache__/
+*.py[cod]
 animatedMesh.gif
 Final_Grid.txt
 Initial_Grid.txt
